@@ -24,18 +24,19 @@ with the following 3 tasks and only:
 
 - Tell dad jokes.
 - Provide cooking inspirations. Make sure to ask the user for the cusine they like as well as available ingredients.
-- Search the internet and summerize news that the user is interested in. You will have access to the `tavily_search` tool, \
-which calls Tavily API to perform internet search.
+- Search the internet and summerize news that the user is interested in. You have access to the `tavily_search` tool, \
+which calls Tavily API to perform internet search. You will use this tool when the user wants to know recent news about something. \
+While you're waiting for the function call results, kindly ask the user to wait for a moment. \
+Always pause for a second before you start talking about the tool call results.
 
 If the user ask you to perform tasks other than the 3 listed, kindly reject the request and remind them with the tasks you could \
-assist them with. Always stay positive, but work in a joke when appropriate.\
+assist them with. Always stay positive, but work in a joke when appropriate. Talk quickly.\
 """
 VOICE = 'alloy'
 LOG_EVENT_TYPES = [
-    'error', 'response.content.done', 'rate_limits.updated',
-    'response.done', 'input_audio_buffer.committed',
-    'input_audio_buffer.speech_stopped', 'input_audio_buffer.speech_started',
-    'session.created'
+    'error', 'response.content.done', 'rate_limits.updated', 'response.done',
+    'input_audio_buffer.committed', 'input_audio_buffer.speech_stopped',
+    'input_audio_buffer.speech_started', 'session.created'
 ]
 SHOW_TIMING_MATH = False
 
@@ -45,34 +46,47 @@ sessions = dict()
 app = FastAPI()
 
 if not AZURE_OPENAI_API_KEY:
-    raise ValueError('Missing the Azure OpenAI API key. Please set it in the .env file.')
+    raise ValueError(
+        'Missing the Azure OpenAI API key. Please set it in the .env file.')
+
+if not AZURE_OPENAI_ENDPOINT:
+    raise ValueError(
+        'Missing the Azure OpenAI API key. Please set it in the .env file.')
+
 
 @app.get("/", response_class=JSONResponse)
 async def index_page():
     return {"message": "Twilio Media Stream Server is running!"}
+
 
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
     """Handle incoming call and return TwiML response to connect to Media Stream."""
     response = VoiceResponse()
     # <Say> punctuation to improve text-to-speech flow
-    response.say("Please wait while we connect your call to the A. I. voice assistant. If you have any comments you would like to provide, please contact Aslan via aslanncs@gmail.com.")
+    response.say(
+        "Please wait while we connect your call to the AI voice assistant."
+    )
     response.pause(length=1)
-    response.say("O.K. you can start talking!")
+    response.say(
+        "If you have any comments you would like to provide, please contact the creator."
+    )
     host = request.url.hostname
     connect = Connect()
     connect.stream(url=f'wss://{host}/media-stream')
     response.append(connect)
-    
+
     # Collect call info
-    caller_number = request.form.get("From", "Unknown")
-    session_id = request.form.get("CallSid")
+    form_data = await request.form()
+    caller_number = form_data.get("From", "Unknown")
+    session_id = form_data.get("CallSid")
     print(f"Caller Number: {caller_number}")
     print(f"Session Id (CallSid): {session_id}")
     # Update sessions
     sessions.update({session_id: {"transcript": ""}})
 
     return HTMLResponse(content=str(response), media_type="application/xml")
+
 
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
@@ -85,15 +99,13 @@ async def handle_media_stream(websocket: WebSocket):
 
     # Get the session data or create a new session
     session = sessions.get(session_id) or {"transcript": ""}
-    sessions.update({session_id: {"transcript": ""}})
+    sessions.update({session_id: session})
 
     async with websockets.connect(
         AZURE_OPENAI_ENDPOINT,
         extra_headers={
-            "Authorization": f"Bearer {AZURE_OPENAI_API_KEY}",
-            # "OpenAI-Beta": "realtime=v1"
-        }
-    ) as openai_ws:
+            "api-key": AZURE_OPENAI_API_KEY,
+    }) as openai_ws:
         await initialize_session(openai_ws)
 
         # Connection specific state
@@ -102,7 +114,7 @@ async def handle_media_stream(websocket: WebSocket):
         last_assistant_item = None
         mark_queue = []
         response_start_timestamp_twilio = None
-        
+
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
             nonlocal stream_sid, latest_media_timestamp
@@ -110,7 +122,8 @@ async def handle_media_stream(websocket: WebSocket):
                 async for message in websocket.iter_text():
                     data = json.loads(message)
                     if data['event'] == 'media' and openai_ws.open:
-                        latest_media_timestamp = int(data['media']['timestamp'])
+                        latest_media_timestamp = int(
+                            data['media']['timestamp'])
                         audio_append = {
                             "type": "input_audio_buffer.append",
                             "audio": data['media']['payload']
@@ -126,10 +139,31 @@ async def handle_media_stream(websocket: WebSocket):
                         if mark_queue:
                             mark_queue.pop(0)
             except WebSocketDisconnect:
-                print("Client disconnected.")
-                print(f"Full transcript ({session_id}):\n\n{session.transcript}")
+                print("WebSocketDisconnect exception caught")  # Debug log
+                print(f"Client disconnected ({session_id}).")
+                print(f"Full transcript ({session_id}):\n{session['transcript']}")
                 if openai_ws.open:
                     await openai_ws.close()
+                if session_id in sessions:
+                    del sessions[session_id]
+            except Exception as e:
+                print(f"Exception details: {str(e)}")
+                if isinstance(e, websockets.exceptions.ConnectionClosed):
+                    print("Connection was closed")
+                print(f"Client disconnected with error ({session_id}).")
+                print("Full Transcript:")
+                print(session.get('transcript', ''))
+            finally:
+                print(f"Full transcript ({session_id}):\n{session['transcript']}")
+                try:
+                    if openai_ws.open:
+                        print("Closing OpenAI WebSocket")
+                        await openai_ws.close()
+                    if session_id in sessions:
+                        print(f"Cleaning up session {session_id}")
+                        del sessions[session_id]
+                except Exception as cleanup_error:
+                    print(f"Error during cleanup: {cleanup_error}")
 
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
@@ -171,27 +205,39 @@ async def handle_media_stream(websocket: WebSocket):
 
                     # Log agent message
                     if response.get('type') == 'response.done':
-                        agent_msg = response.response.output[0].content.get("transcript", "Assistant message not found")
-                        session.transcript += f"Agent: {agent_msg}\n"  # Add agent's message to the transcript
+                        agent_msg = ""
+                        response_output = response.get('response', {}).get('output', [])
+                        if response_output:
+                            content_list = response_output[0].get('content', [])
+                            if content_list:
+                                agent_msg = content_list[0].get('transcript', "Assistant message not found")
+                        else:
+                            agent_msg = "Assistant message not found"
+                        session['transcript'] += f"\nAgent: {agent_msg}\n"
                         print(f"Agent ({session_id}): {agent_msg}")
 
+                    # Log user message
                     if response.get('type') == 'conversation.item.input_audio_transcription.completed' and 'transcript' in response:
-                        user_msg = response.transcript.strip()
-                        session.transcript += f"User: {user_msg}\n"
+                        user_msg = response.get("transcript", "User message not found").strip()
+                        session['transcript'] += f"\nUser: {user_msg}\n"
                         print(f"User ({session_id}): {user_msg}")
 
                     if response.get('type') == 'response.function_call_arguments.done':
                         print(f"Function called: {response}")
                         function_name = response.get("name")
                         function_args = json.loads(response.get("arguments"))
+                        call_id = response.get("call_id")
 
                         user_query = function_args.get("query")
 
                         if function_name == "tavily_search":
                             try:
-                                search_result = await tavily_search(**function_args)
-                                search_answer = search_result[0]
-                                search_content = search_result[1] or "Sorry, no results found for that question."
+                                search_result = await tavily_search(
+                                    **function_args)
+                                if search_result:
+                                    search_content = search_result[1] 
+                                else:
+                                    search_content = "Sorry, no results found for that question."
 
                                 # Send function call result back to OpenAI
                                 function_output_event = {
@@ -199,22 +245,24 @@ async def handle_media_stream(websocket: WebSocket):
                                     "item": {
                                         "type": "function_call_output",
                                         "output": search_content,
+                                        "call_id": call_id,
                                     }
                                 }
-                                openai_ws.send(json.dumps(function_output_event))
+                                await openai_ws.send(json.dumps(function_output_event))
                                 print(f"Sent function call result: {function_output_event}")
 
                                 function_call_response_from_openai = {
                                     "type": "response.create",
                                     "response": {
                                         "modalities": ["text", "audio"],
-                                        "instructions": f"Summarize the news and respond to the user's question {user_query} based on this news summary: {search_content}. Be concise and friendly.",
+                                        "instructions":
+                                        f"Summarize the news and respond to the user's question {user_query} based on this news summary: {search_content}. Be concise and friendly. Do not use bullet points in your response.",
                                     }
                                 }
-                                openai_ws.send(json.dumps(function_call_response_from_openai))
+                                await openai_ws.send(json.dumps(function_call_response_from_openai))
                             except Exception as e:
                                 print(f"Error calling function {function_name}: {e}")
-                                send_error_response(openai_ws)
+                                await send_error_response(openai_ws)
             except Exception as e:
                 print(f"Error in send_to_twilio: {e}")
 
@@ -225,7 +273,9 @@ async def handle_media_stream(websocket: WebSocket):
             if mark_queue and response_start_timestamp_twilio is not None:
                 elapsed_time = latest_media_timestamp - response_start_timestamp_twilio
                 if SHOW_TIMING_MATH:
-                    print(f"Calculating elapsed time for truncation: {latest_media_timestamp} - {response_start_timestamp_twilio} = {elapsed_time}ms")
+                    print(
+                        f"Calculating elapsed time for truncation: {latest_media_timestamp} - {response_start_timestamp_twilio} = {elapsed_time}ms"
+                    )
 
                 if last_assistant_item:
                     if SHOW_TIMING_MATH:
@@ -253,12 +303,15 @@ async def handle_media_stream(websocket: WebSocket):
                 mark_event = {
                     "event": "mark",
                     "streamSid": stream_sid,
-                    "mark": {"name": "responsePart"}
+                    "mark": {
+                        "name": "responsePart"
+                    }
                 }
                 await connection.send_json(mark_event)
                 mark_queue.append('responsePart')
 
         await asyncio.gather(receive_from_twilio(), send_to_twilio())
+
 
 async def send_initial_conversation_item(openai_ws):
     """Send initial conversation item if AI talks first."""
@@ -284,7 +337,9 @@ async def initialize_session(openai_ws):
     session_update = {
         "type": "session.update",
         "session": {
-            "turn_detection": {"type": "server_vad"},
+            "turn_detection": {
+                "type": "server_vad"
+            },
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
             "voice": VOICE,
@@ -306,15 +361,18 @@ async def initialize_session(openai_ws):
     # Uncomment the next line to have the AI speak first
     await send_initial_conversation_item(openai_ws)
 
+
 async def send_error_response(openai_ws):
     """Helper function for sending error responses"""
-    openai_ws.send(json.dumps({
-        "type": "response.create",
-        "response": {
-            "modalities": ["text", "audio"],
-            "instructions": "I apologize, but I'm having trouble processing your request right now. Is there anything else I can help you with?",
-        }
-    }))
+    await openai_ws.send(
+        json.dumps({
+            "type": "response.create",
+            "response": {
+                "modalities": ["text", "audio"],
+                "instructions":
+                "I apologize, but I'm having trouble processing your request right now. Is there anything else I can help you with?",
+            }
+        }))
 
 if __name__ == "__main__":
     import uvicorn
