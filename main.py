@@ -2,6 +2,7 @@ import os
 import json
 import time
 import base64
+import aiohttp
 import asyncio
 import websockets
 from fastapi import FastAPI, WebSocket, Request
@@ -17,6 +18,7 @@ from tools import tavily_search_tool_json, tavily_search
 # Configuration
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+MAKE_WEBHOOK_URL = os.getenv("MAKE_WEBHOOK_URL")
 PORT = int(os.getenv("PORT", 5050))
 SYSTEM_MESSAGE = """\
 You are a helpful and bubbly AI assistant called Ada, created by Data Scientist Aslan Shi. You will help the user \
@@ -78,8 +80,7 @@ async def handle_incoming_call(request: Request):
     )
     host = request.url.hostname
     connect = Connect()
-    connect.stream(url=f"wss://{host}/media-stream")
-    response.append(connect)
+    stream = connect.stream(url=f"wss://{host}/media-stream")
 
     # Collect call info
     form_data = await request.form()
@@ -87,8 +88,64 @@ async def handle_incoming_call(request: Request):
     session_id = form_data.get("CallSid")
     print(f"Caller Number: {caller_number}")
     print(f"Session Id (CallSid): {session_id}")
+
+    first_message = "Greet the user with 'Hello there! I am Ada, an AI voice assistant created by Aslan. You can ask me for dad jokes, cooking inspirations and news summary. May I first know your name, please?'"
+
+    # Send the caller's number to Make.com webhook to get a personalized first message
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                MAKE_WEBHOOK_URL,
+                headers={"Content-Type": "application/json"},
+                json={
+                    "route": "1",
+                    "data1": caller_number,
+                    "data2": "",  # Extra data (not used here)
+                },
+            ) as webhook_response:
+
+                print(f"Webhook response status: {webhook_response.status}")
+
+                if webhook_response.ok:
+                    webhook_response_text = await webhook_response.text()
+                    print(f"Webhook response: {webhook_response_text}")
+                    try:
+                        webhook_response_data = json.loads(webhook_response_text)
+                        if webhook_response_data and webhook_response_data.get(
+                            "firstMessage"
+                        ):
+                            first_message = webhook_response_data["firstMessage"]
+                            print("Parsed firstMessage from Make.com:", first_message)
+                    except json.JSONDecodeError as parse_error:
+                        print(
+                            "Error parsing webhook response:", parse_error
+                        )  # Log any errors while parsing the response
+                        first_message = (
+                            webhook_response_text.strip()
+                        )  # Use the plain text response if parsing fails
+                else:
+                    error_msg = (
+                        f"Failed to send data to webhook: {webhook_response.reason}"
+                    )
+                    print(error_msg)
+
+    except Exception as error:
+        print(f"Error sending data to webhook: {str(error)}")
+
     # Update sessions
-    sessions.update({session_id: {"transcript": ""}})
+    session = {
+        "transcript": "",
+        "caller_number": caller_number,
+        "first_message": first_message,
+    }
+    sessions.update({session_id: session})
+
+    # Add customer parameters
+    # TODO: not actually used in the later functions
+    # as long as later it could locate the correct session
+    stream.parameter(name="caller_number", value=caller_number)
+    stream.parameter(name="first_message", value=first_message)
+    response.append(connect)
 
     return HTMLResponse(content=str(response), media_type="application/xml")
 
@@ -100,13 +157,18 @@ async def handle_media_stream(websocket: WebSocket):
     await websocket.accept()
 
     # Use Twilio's CallSid as the session ID or create a new one based on the timestamp
+    # TODO: headers don't contain the call sid, so it always uses timestamp
+    # which results in creating a session overwritting the previous one every time
+    # and thus losing caller number and first message
+    # currently skipping this retriving Call Sid again during the `start` event
     session_id = (
         websocket.headers.get("x-twilio-call-sid") or f"session_{int(time.time())}"
     )
 
     # Get the session data or create a new session
+    # Currently not used as explained above
     session = sessions.get(session_id) or {"transcript": ""}
-    sessions.update({session_id: session})
+    # sessions.update({session_id: session})
 
     async with websockets.connect(
         AZURE_OPENAI_ENDPOINT,
@@ -123,9 +185,15 @@ async def handle_media_stream(websocket: WebSocket):
         mark_queue = []
         response_start_timestamp_twilio = None
 
+        async def send_first_message(first_message):
+            """Send first message using webhook results"""
+            print("Sending first message:", first_message)
+            await openai_ws.send(json.dumps(first_message))
+            await openai_ws.send(json.dumps({"type": "response.create"}))
+
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
-            nonlocal stream_sid, latest_media_timestamp
+            nonlocal stream_sid, latest_media_timestamp, session, session_id
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
@@ -136,12 +204,37 @@ async def handle_media_stream(websocket: WebSocket):
                             "audio": data["media"]["payload"],
                         }
                         await openai_ws.send(json.dumps(audio_append))
+
                     elif data["event"] == "start":
                         stream_sid = data["start"]["streamSid"]
                         print(f"Incoming stream has started {stream_sid}")
                         response_start_timestamp_twilio = None
                         latest_media_timestamp = 0
                         last_assistant_item = None
+
+                        # Get call sid
+                        call_sid = data["start"]["callSid"]
+                        session_id = call_sid
+                        session = sessions[session_id]
+
+                        # Prepare the first message
+                        first_message = session.get(
+                            "first_message",
+                            "Greet the user with 'Hello there! I am Ada, an AI voice assistant created by Aslan. You can ask me for dad jokes, cooking inspirations and news summary. How can I help you?'",
+                        )
+                        queued_first_message = {
+                            "type": "conversation.item.create",
+                            "item": {
+                                "type": "message",
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_text", "text": first_message}
+                                ],
+                            },
+                        }
+                        await send_first_message(queued_first_message)
+                        del queued_first_message
+
                     elif data["event"] == "mark":
                         if mark_queue:
                             mark_queue.pop(0)
@@ -151,6 +244,14 @@ async def handle_media_stream(websocket: WebSocket):
                 print(f"Full transcript ({session_id}):\n{session['transcript']}")
                 if openai_ws.open:
                     await openai_ws.close()
+
+                await send_to_webhook(
+                    {
+                        "route": "2",
+                        "data1": session["caller_number"],
+                        "data2": session["transcript"],
+                    }
+                )
                 if session_id in sessions:
                     del sessions[session_id]
             except Exception as e:
@@ -166,6 +267,14 @@ async def handle_media_stream(websocket: WebSocket):
                     if openai_ws.open:
                         print("Closing OpenAI WebSocket")
                         await openai_ws.close()
+
+                    await send_to_webhook(
+                        {
+                            "route": "2",
+                            "data1": session["caller_number"],
+                            "data2": session["transcript"],
+                        }
+                    )
                     if session_id in sessions:
                         print(f"Cleaning up session {session_id}")
                         del sessions[session_id]
@@ -174,7 +283,7 @@ async def handle_media_stream(websocket: WebSocket):
 
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
-            nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio
+            nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio, session, session_id
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
@@ -378,7 +487,7 @@ async def initialize_session(openai_ws):
     await openai_ws.send(json.dumps(session_update))
 
     # Uncomment the next line to have the AI speak first
-    await send_initial_conversation_item(openai_ws)
+    # await send_initial_conversation_item(openai_ws)
 
 
 async def send_error_response(openai_ws):
@@ -394,6 +503,35 @@ async def send_error_response(openai_ws):
             }
         )
     )
+
+
+async def send_to_webhook(payload):
+    """Function to send data to the Make.com webhook"""
+    # Log the data being sent
+    print(f"Sending data to webhook: {json.dumps(payload, indent=2)}")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                MAKE_WEBHOOK_URL,
+                headers={"Content-Type": "application/json"},
+                json=payload,
+            ) as response:
+
+                print(f"Webhook response status: {response.status}")
+
+                if response.ok:
+                    response_text = await response.text()
+                    print(f"Webhook response: {response_text}")
+                    return response_text
+                else:
+                    error_msg = f"Failed to send data to webhook: {response.reason}"
+                    print(error_msg)
+                    raise Exception(error_msg)
+
+    except Exception as error:
+        print(f"Error sending data to webhook: {str(error)}")
+        raise
 
 
 if __name__ == "__main__":
