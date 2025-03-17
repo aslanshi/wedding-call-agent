@@ -16,23 +16,34 @@ load_dotenv()
 from tools import tavily_search_tool_json, tavily_search
 
 # Configuration
+# OPENAI_ENDPOINT_URL = os.getenv("OPENAI_ENDPOINT_URL")
+# OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 MAKE_WEBHOOK_URL = os.getenv("MAKE_WEBHOOK_URL")
 PORT = int(os.getenv("PORT", 5050))
 SYSTEM_MESSAGE = """\
-You are a helpful and bubbly AI assistant called Ada, created by Data Scientist Aslan Shi. You will help the user \
-with the following 3 tasks and only:
+You are Ada, a helpful wedding assistant created by A (groom) for his and B's (bride) wedding on June 27th, 2025.
 
-- Tell dad jokes.
-- Provide cooking inspirations. Make sure to ask the user for the cusine they like as well as available ingredients.
-- Search the internet and summerize news that the user is interested in. You have access to the `tavily_search` tool, \
-which calls Tavily API to perform internet search. You will use this tool when the user wants to know recent news about something. \
-While you're waiting for the function call results, kindly ask the user to wait for a moment. \
-Always pause for a second before you start talking about the tool call results.
+Your purpose: Help guests participate in a special wedding day game. This game encourages guest interaction by requiring them to find answers to 3 questions by talking to other guests who share special memories with the couple.
 
-If the user ask you to perform tasks other than the 3 listed, kindly reject the request and remind them with the tasks you could \
-assist them with. Always stay positive, but work in a joke when appropriate. Talk quickly.\
+Your specific task: When guests call before the wedding, provide them with one preview question and hint they'll encounter during the game:
+- Question: "What's the city name where the groom's college is located?"
+- Hint: "Find someone who's been working in Mexico."
+
+Conversation flow:
+1. Warmly greet guests and thank them for sharing special moments with A and B
+2. Briefly explain how the game will work on the wedding day
+3. Share the question and hint
+4. If they've called before (you'll be provided their name and call history), greet them by name and offer to repeat the information
+5. Offer a funny dad joke if they're interested
+
+Response guidelines:
+- Only answer questions about the game and provide the designated hint
+- For game details you don't know, politely direct guests to the couple
+- For other wedding information, refer them to the wedding website
+- Maintain a positive, quick-paced conversation style
+- Include appropriate humor when fitting\
 """
 VOICE = "alloy"
 LOG_EVENT_TYPES = [
@@ -59,7 +70,7 @@ if not AZURE_OPENAI_API_KEY:
 
 if not AZURE_OPENAI_ENDPOINT:
     raise ValueError(
-        "Missing the Azure OpenAI API key. Please set it in the .env file."
+        "Missing the Azure OpenAI Endpoint URL. Please set it in the .env file."
     )
 
 
@@ -76,7 +87,7 @@ async def handle_incoming_call(request: Request):
     response.say("Please wait while we connect your call to the AI voice assistant.")
     response.pause(length=1)
     response.say(
-        "If you have any comments you would like to provide, please contact the creator."
+        "Connected!"
     )
     host = request.url.hostname
     connect = Connect()
@@ -89,7 +100,13 @@ async def handle_incoming_call(request: Request):
     print(f"Caller Number: {caller_number}")
     print(f"Session Id (CallSid): {session_id}")
 
-    first_message = "Greet the user with 'Hello there! I am Ada, an AI voice assistant created by Aslan. You can ask me for dad jokes, cooking inspirations and news summary. May I first know your name, please?'"
+    first_message = (
+        "Greet the user with 'Hello there! Welcome to Aslan and Bingru's wedding celebration! "
+        "Thank you so much for being an important part of their journey together. "
+        "I am Ada, an AI voice assistant created by Aslan. "
+        "I'm here to tell you about a fun game you'll get to play on the wedding day! "
+        "May I first know your name, please?'"
+    )
 
     # Send the caller's number to Make.com webhook to get a personalized first message
     try:
@@ -220,7 +237,7 @@ async def handle_media_stream(websocket: WebSocket):
                         # Prepare the first message
                         first_message = session.get(
                             "first_message",
-                            "Greet the user with 'Hello there! I am Ada, an AI voice assistant created by Aslan. You can ask me for dad jokes, cooking inspirations and news summary. How can I help you?'",
+                            "Greet the user with 'Hello there! Welcome to Aslan and Bingru's wedding celebration! Thank you so much for being an important part of their journey together. I am Ada, an AI voice assistant created by Aslan. I'm here to tell you about a fun game you'll get to play on the wedding day! May I first know your name, please?'",
                         )
                         queued_first_message = {
                             "type": "conversation.item.create",
@@ -477,10 +494,10 @@ async def initialize_session(openai_ws):
             "modalities": ["text", "audio"],
             "temperature": 0.8,
             "input_audio_transcription": {"model": "whisper-1"},
-            "tools": [
-                tavily_search_tool_json,
-            ],
-            "tool_choice": "auto",
+            # "tools": [
+            #     tavily_search_tool_json,
+            # ],
+            # "tool_choice": "auto",
         },
     }
     print("Sending session update:", json.dumps(session_update))
