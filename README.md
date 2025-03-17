@@ -6,7 +6,7 @@ A voice assistant powered by Azure OpenAI, Twilio, and FastAPI that can give my 
 
 - 🎭 Interactive voice conversations using Azure OpenAI
 - 🔊 Real-time audio streaming via Twilio Media Streams
-- 🤖 Three main capabilities:
+- 🤖 Two main capabilities:
   - Give my guests a hint to the Bingo game that we're about to play on the day of my wedding
   - Offer to repeat the hint or dad jokes if guests are calling back (use Make.com to store caller information and chat history in a Google Spreadsheet)
 - 🎙️ Natural conversation with voice interruption support
